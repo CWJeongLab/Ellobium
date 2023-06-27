@@ -1,0 +1,331 @@
+###################################################################################################################################################################################
+## MSMC & MSMC2 script                                                                                                                                                           ##
+## MSMC infers population size history and split time between two populations.                                                                                                   ##
+## To make MSMC input (mulihet file), there are three requirements, which are mappapbility-mask file, sample-mask file, phased or unphased vcf file for each sample.             ##
+## With unphased data, you cannot infer split time between two populations. Or use X chromosome of male.                                                                         ##
+## If the species of your data genome does not have reliable phased reference panel, I recommend you to use unphased vcf file,                                                   ##
+## and use MSMC2 option which infer only coalescent events within individual. This is because phasing error can affect seriously the inference.                                  ##
+## This script is for unphased data.                                                                                                                                             ##
+##                                                                                                                                                                               ##
+## The stages are divided into two stages. Preparation stage for making input file and Analysis stage.                                                                           ##
+## The preparation stage is again divided into three steps.                                                                                                                      ##
+## 1. Making mappability-mask file                                                                                                                                               ##
+## 2. Making vcf file and sample-mask file. One for each sample.                                                                                                                 ##
+## 3. Making mulihet file for MSMC analysis using those three inputs.                                                                                                            ##
+##                                                                                                                                                                               ##
+## The analysis is divided into two steps. Inference and plotting.                                                                                                               ##
+##                                                                                                                                                                               ##
+## Refer to these main papers and manual                                                                                                                                         ##
+## 1. MSMC paper : Schiffels and Durbin, 2014, Nature Genetics                                                                                                                   ##
+## 2. MSMC2 paper : Wang, Ke, Iain Mathieson, Jared O’Connell, and Stephan Schiffels. 2020. PLoS Genetics                                                                        ##
+## 3. MSMC tutorial : https://link.springer.com/protocol/10.1007/978-1-0716-0199-0_7#Sec13                                                                                       ##
+## 4. MSMC github : https://github.com/stschiff/msmc-tools, https://github.com/stschiff/msmc2                                                                                    ##
+###################################################################################################################################################################################
+
+#########################################################################################
+## 0-1. Make mappability mask fasta file                                               ##
+## Try Heng Li's mappability filtering (SNPable) for the human reference               ##
+## Follow the instruction from: http://lh3lh3.users.sourceforge.net/snpable.shtml      ##
+#########################################################################################################################################
+## The scheme of the procedure is following behind.                                                                                    ##
+## 1. split the reference genome to 35-bp non-overlapping chunks                                                                       ##
+## 2. map the chunks as short read to the reference                                                                                    ##
+## 3. score the mapping quality for read (whether it does be mapped to the same location or not). c=0~3. 35bp share same score.        ##
+## 4. we will use only regions of which score c=3, so we will make bed file for marking these regions.                                 ##
+#########################################################################################################################################
+## I will only use ~scaffold515 fasta file (mappability masked),         ##
+## which has base number > 500000 (~81% of whole reference genome)       ##
+###########################################################################
+
+cd /home/projects1/Ellobium/
+
+mkdir -p ./mappability/; cd ./mappability/
+
+pt1=($(pwd)"/")
+ref="/home/projects1/Ellobium/FastQ/Reference_assembly/Elch_new_over2000.fa" ## reference fasta file
+scf1=${pt1}"bwa_210803.sh"
+of1="Ellobium_mask_35_50"  ## Mappability masked fasta file
+tn1="temp1_"${of1}
+nscaf=515  ## scaffold number
+
+## Split the reference genome to 35-bp non-overlapping chunks
+splitfa ${ref} 35 | split -d -a 2 --numeric-suffixes=1 -l 20000000 \
+    --filter='gzip > $FILE.gz' - ${tn1}_
+
+idnmax=($(ls ${tn1}_*.gz | wc -l))
+nperrun=3
+
+## Run the job as a job array
+sbatch --array=1-${idnmax}%${nperrun} -c 12 --mem 22500 --wrap=${scf1}" "${tn1}" "${ref}
+
+## Crate raw mask file
+## rewrite gen_raw_mask.pl because it generate one character for 35 bp. So I multiply 35 times. (by dhkim)
+gzip -dc ${tn1}_??.sam.gz | gen_raw_mask.pl > ${tn1}_1.fa 
+
+## Create the final mask file with threshold 0.5 (-r 0.5)
+gen_mask -l 35 -r 0.5 ${tn1}_1.fa > ${tn1}_2.fa
+
+## Move the final file
+mv ${tn1}_2.fa ${of1}.fa
+
+## Make mappability masked ~scaffold515 fasta file
+nrow=$(grep -n -w ">scaffold"$(expr ${nscaf} + 1) ${of1}.fa | awk -F ':' '{print $1-1}')
+head -${nrow} ${of1}.fa > ${of1}"_scaff"${nscaf}".fa"
+
+## Remove temporary files
+rm ${tn1}_*; rm slurm-*
+
+
+############################################
+## Save the following as "bwa_210803.sh"  ##
+
+#!/bin/bash
+
+fn1=$1  ## File name prefix
+ref=$2  ## reference
+
+inum=$SLURM_ARRAY_TASK_ID
+
+if [ "$inum" -lt 10 ]; then lnum="0"${inum}; else lnum=${inum}; fi
+
+fn2=${fn1}"_"${lnum}
+
+bwa aln -t 8 -R 1000000 -O 3 -E 3 -f ${fn2}.sai ${ref} ${fn2}.gz
+
+bwa samse ${ref} ${fn2}.sai ${fn2}.gz | gzip > ${fn2}.sam.gz
+
+
+#####################################################################################################
+## save the following script as "/opt/ohpc/pub/apps/seqability/seqbility-20091110/gen_raw_mask.pl" ##
+
+#!/usr/bin/perl -w
+
+use strict;
+use warnings;
+
+&main;
+exit;
+
+sub main {
+  die("Usage: gen_mask.pl <bwa.sam>\n") if (@ARGV == 0 && -t STDIN);
+  my @conv = (0 .. 127);
+  # calculate conv table
+  for (1 .. 127) {
+        $conv[$_] = &int_log2($_) + 1;
+  }
+  $conv[0] = 0;
+
+  # core loop
+  my ($last, $seq) = ('', '');
+  my $lineno = 0;
+  while (<>) {
+        if (/^(\S+)_(\d+)/) {
+          ++$lineno;
+          my ($a0, $a1) = (0, 0);
+          if ($last ne $1) {
+                &print_seq($last, \$seq) if ($last);
+                $last = $1; $seq = '';
+          }
+          $a0 = $1 > 127? 127 : $1 if (/X0:i:(\d+)/);
+          $a1 = $1 > 127? 127 : $1 if (/X1:i:(\d+)/);
+          $seq .= chr(63 + ($conv[$a0]<<3 | $conv[$a1]))x35; ## I edit this sentence 
+        }
+        warn("$lineno lines processed\n") if ($lineno % 1000000 == 0);
+  }
+  &print_seq($last, \$seq);
+}
+
+sub print_seq {
+  my ($last, $seq) = @_;
+  print ">$last\n";
+  for (my $i = 0; $i < length($$seq); $i += 60) {
+        print substr($$seq, $i, 60), "\n";
+  }
+}
+
+sub int_log2 {
+  my $v = shift;
+  my $c = 0;
+  if ($v & 0xffff0000) { $v >>= 16; $c |= 16; }
+  if ($v & 0xff00) { $v >>= 8; $c |= 8; }
+  if ($v & 0xf0) { $v >>= 4; $c |= 4; }
+  if ($v & 0xc) { $v >>= 2; $c |= 2; }
+  if ($v & 0x2) { $c |= 1; }
+  return $c;
+}
+
+
+##################################
+## 1. Generate MSMC input files ##
+###############################################################################################
+## There are three steps                                                                     ##
+## 1. Calculate coverage per individual and chromosome using bamfile                         ##
+## 2. generate vcf file and sample-mask file which marks the regions where reads cover.      ##
+## 3. generate mulihet msmc input file merging multiple samples                              ##
+###############################################################################################
+
+cd /home/projects1/Ellobium/analysis/
+
+mkdir -p ./MSMC_220805/input; mkdir -p ./MSMC_220805/raw_input; cd ./MSMC_220805/raw_input
+
+pt1=($(pwd)"/")
+scf0=${pt1}"calculate_coverage_220805.sh"
+scf1=${pt1}"run_bamCaller_220805.sh"
+scf2=${pt1}"generate_multihetsep_220807.sh"
+scf3="/opt/ohpc/pub/apps/msmc-tools/generate_multihetsep.py"
+ref="/home/projects1/Ellobium/FastQ/Reference_assembly/Elch_new_over2000.fa" ## reference fasta file
+fn1="/home/projects1/Ellobium/rawBAM_220711/Ellobium_fastq_list_220711.txt"  ## list of samples
+nscaf=515  ## scaffold number
+
+## 1. Calculate coverage per individual and scaffold using bamfile
+## comma seperated sample ids without reference individual "Korea_1"
+iids=$(tail -n +2 ${fn1} | awk '{print $3}' | grep -v "Elch_KR_03" | tr '\n' ',' | sed 's/.$/\n/')
+
+## Make directory per individual
+for iid in $(tail -n +2 ${fn1} | awk '{print $3}' | grep -v "Elch_KR_03"); do mkdir ./${iid}/; done
+
+## Submit the job as array
+nrun=$(echo ${iids} | awk -F ',' '{print NF}')
+nval=14
+
+sbatch --array=1-${nrun}%${nval} -c 8 --mem 15000 --wrap=${scf0}" "${iids}" "${nscaf}
+
+
+#################################################################
+## Save the following script as "calculate_coverage_220805.sh" ##
+
+#!/bin/bash
+
+iids=$1
+nscaf=$2
+inum=$SLURM_ARRAY_TASK_ID
+pt1=($(pwd)"/")
+
+## Retrieve the individual ID, inbam and coverage file
+iid=($(echo ${iids} | cut -d ',' -f ${inum}))
+inbam="/home/projects1/Ellobium/rawBAM_220711/"${iid}"/"${iid}".mapped.rmdup.q30.bam"
+
+## one line per one scaffold
+covf=${pt1}${iid}"/"${iid}".coverage.txt"
+for scaff in $(seq 1 ${nscaf}); do
+    cov=($(samtools depth -r "scaffold"${scaff} ${inbam} | awk '{sum += $3} END {print sum / NR}'))
+    echo -e "scaffold"${scaff}"\t"${cov} >> ${covf}
+    echo "scaffold"${scaff}" is finished"
+done
+
+
+################################################################################################
+## 2. Generate vcf file and sample-mask file which marks the regions where reads cover        ##
+## Create a list of comma-separated index numbers to run bamCaller.py                         ##
+## This is a requirement for running the slurm job array                                      ##
+## You should start index number with 0                                                       ## 
+## You should change 22 to the number of chromosomes for organisms other human                ##
+
+## Set the number of jobs to be run at a time
+nrun=$(echo ${iids} | awk -F ',' '{print NF}')
+nval=14
+
+## Submit the job as a job array
+sbatch --array=1-${nrun}%${nval} -c 8 --mem 15000 --wrap=${scf1}" "${iids}" "${nscaf}
+
+
+############################################################
+## Save the following script as "run_bamCaller_220805.sh" ##
+
+#!/bin/bash
+
+pt1=($(pwd)"/")
+iids=$1
+nscaf=$2
+inum=$SLURM_ARRAY_TASK_ID
+
+iid=($(echo ${iids} | cut -d ',' -f ${inum}))
+covf=${pt1}${iid}"/"${iid}".coverage.txt"  ## one line per one scaffold
+inbam="/home/projects1/Ellobium/rawBAM_220711/"${iid}"/"${iid}".mapped.rmdup.q30.bam"
+
+ref="/home/projects1/Ellobium/FastQ/Reference_assembly/Elch_new_over2000.fa" ## reference fasta file
+scf="/opt/ohpc/pub/apps/msmc-tools/bamCaller.py"
+
+for i in $(seq 1 ${nscaf}); do
+    cov=($(head -${i} ${covf} | tail -1 | awk '{print $2}'))
+    of1=${pt1}${iid}"/"${iid}".scaffold"${i}".mask.bed.gz"  ## sample-masked file per chromosome
+    of2=${pt1}${iid}"/"${iid}".scaffold"${i}".vcf.gz"  ## gziped sample-masked file per chromosome
+    samtools mpileup -q 20 -Q 20 -C 50 -u -r "scaffold"${i} -f ${ref} ${inbam} | bcftools call -c -V indels | ${scf} ${cov} ${of1} | bgzip -c > ${of2}
+done
+
+
+
+################################################################################
+## 3. generate mulihet msmc input file merging multiple samples               ##
+## There are three requirements. VCF, mappability mask, sample mask           ##
+## Create a list of make files and unphased vcf files                         ## 
+## And submit the job to make a final input file                              ##
+
+## Run the job per scaffold
+nrun=${nscaf}   ## scaffold number
+nval=29
+
+sbatch --array=1-${nrun}%${nval} -c 8 --mem 15000 --wrap=${scf2}" "${iids}" "${scf3}
+
+## Remove temporary files
+rm slurm-*
+
+####################################################################
+##  Save the following script as "generate_multihetsep_220807.sh" ##
+
+#!/bin/bash
+
+pt1=($(pwd)"/")
+iids=$1
+scf3=$2
+nscaf=$SLURM_ARRAY_TASK_ID   ## set scaffold number as job array number
+
+
+ml=""; vl=""; for iid in $(echo ${iids} | sed 's/,/\n/g'); do
+    ml1=${pt1}${iid}"/"${iid}".scaffold"${nscaf}".mask.bed.gz"  ## sample-masked file per chromosome
+    vl1=${pt1}${iid}"/"${iid}".scaffold"${nscaf}".vcf.gz"  ## gziped sample-masked file per chromosome
+    if [[ "$ml" == "" ]]; then ml="--mask="${ml1}; else ml+=" --mask="${ml1}; fi
+    if [[ "$vl" == "" ]]; then vl=${vl1}; else vl+=" "${vl1}; fi
+done
+
+maskf="/home/projects1/Ellobium/mappability/Ellobium_scaffold"${nscaf}".mask.bed.gz"  ## mappability masked bed file per chromosome
+of="../input/MSMC_test.scaffold"${nscaf}".multihetsep.txt"  ## list of input files per scaffold
+
+${scf3} ${ml} --mask=${maskf} ${vl} > ${of}
+
+
+## From HERE!
+#####################################################################################################
+## 2. Main running for msmc2                                                                       ##
+## Run msmc2 for two scaffold numbers; nscaf=515 (>500000 bp, ~81% of whole reference genome)      ##
+## and nscaf=293 (>1MB, ~64% of whole reference genome)                                            ##
+#####################################################################################################
+
+cd /home/projects1/Ellobium/analysis/MSMC_220805
+
+pt1=($(pwd)"/")
+fn1="/home/projects1/Ellobium/rawBAM_220711/Ellobium_fastq_list_220711.txt"  ## list of samples
+iids=$(tail -n +2 ${fn1} | awk '{print $3}' | grep -v "Elch_KR_03" | tr '\n' ',' | sed 's/.$/\n/')
+nscaf=$(echo 515 293)
+
+## main run for each population
+## Make directory per scaffold number
+for i in ${nscaf}; do mkdir ./msmc2_output_${i}_pop/; done
+
+## Run per scaffold number
+for i in ${nscaf}; do
+    het=""; for K in $(seq 1 ${i}); do het+=" "${pt1}"input/MSMC_test.scaffold"${K}".multihetsep.txt"; done
+    ## main run for each population
+    ## dhkim gave me the permission, so I run msmc2 (2022-08-08)
+    of1=${pt1}"msmc2_output_"${i}"_pop/Elch_CHN.msmc2"  ## Indice for China inds are 0-9
+    CMD1="time /home/donghee_kim/apps/msmc2-2.1.2/msmc2 -t 12 -I 0-1,2-3,4-5,6-7,8-9 -o "${of1}" "${het}
+    sbatch -c 12 --mem 22500 -J msmc2 --wrap="$CMD1"
+    
+    of2=${pt1}"msmc2_output_"${i}"_pop/Elch_JP.msmc2"  ## Indice for Japan inds are 10-19
+    CMD2="time /home/donghee_kim/apps/msmc2-2.1.2/msmc2 -t 12 -I 10-11,12-13,14-15,16-17,18-19 -o "${of2}" "${het}
+    sbatch -c 12 --mem 22500 -J msmc2 --wrap="$CMD2"
+    
+    of3=${pt1}"msmc2_output_"${i}"_pop/Elch_KR.msmc2"  ## Indice for Korea inds are 20-27
+    CMD3="time /home/donghee_kim/apps/msmc2-2.1.2/msmc2 -t 12 -I 20-21,22-23,24-25,26-27 -o "${of3}" "${het}
+    sbatch -c 12 --mem 22500 -J msmc2 --wrap="$CMD3"
+done
