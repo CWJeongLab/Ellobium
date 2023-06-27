@@ -1,0 +1,959 @@
+#############################################################################
+## Processing of Ellobium whole genome sequencing data                     ##
+## from Joong-Ki Park’s research group at Ewha Womans University           ##
+## EWU research group send me fastq files and I start from mapping stage   ##
+#############################################################################
+
+###############################################################################################
+## 1. Align FastQ data of 15 individuals to the reference genome (Elch_new_over2000.fa)      ##
+##    using BWA mem, SAMTOOLS (n=15)                                                         ##
+##    Start at 22/07/11                                                                      ##
+###############################################################################################
+
+cd /home/projects1/Ellobium
+
+mkdir -p ./rawBAM_220711/; cd ./rawBAM_220711/
+
+pt1=($(pwd)"/")
+listf=${pt1}"Ellobium_fastq_list_220711.txt"
+scf=${pt1}"Run_PE_alignment_220711.sh"
+
+## Change FastQ file prefix
+rename R1_001 1 ../FastQ/*/*R1_001.fq.gz
+rename R2_001 2 ../FastQ/*/*R2_001.fq.gz
+
+## Make directories
+while read pid; do mkdir -p ./${pid}; done < <(tail -n +2 ${listf} | awk '{print $3}')
+
+## Use slurm job array function to run BWA mem
+nind=$(tail -n +2 ${listf} | wc -l)
+nval=15
+
+## Submit the job (run BWA mem for PE data) as a job array
+sbatch -J bwamem --array=1-${nind}%${nval} -c 8 --mem 15000 --wrap=${scf}" "${listf}
+
+## Remove temporary files after the jobs are finished
+rm slurm-*
+
+
+##################################################################
+## Save the following script as "Run_PE_alignment_220711.sh"    ##
+
+#!/bin/bash
+
+pt1=($(pwd)"/")
+listf=$1
+inum=$SLURM_ARRAY_TASK_ID
+
+## Retrieve individual ID and FastQ file location
+iid=($(tail -n +2 ${listf} | head -${inum} | tail -1 | awk '{print $3}'))
+lid=${iid}
+fq1=($(tail -n +2 ${listf} | head -${inum} | tail -1 | awk '{print $2"_1.fq.gz"}'))
+fq2=($(tail -n +2 ${listf} | head -${inum} | tail -1 | awk '{print $2"_2.fq.gz"}'))
+
+ref="/home/projects1/Ellobium/FastQ/Reference_assembly/Elch_new_over2000.fa"
+
+cd ${pt1}${iid}/
+
+## Define BAM file name prefix
+of1=${iid}".mapped"  ## match prefix with EWU nomenclature
+
+## Define read group
+RG="@RG\tID:"${lid}"\tSM:"${iid}"\tLB:"${lid}"\tPL:illumina"
+
+## Run BWA mem and filter properly mapped paired reads for creating BAM file
+bwa mem -t 8 -M -R ${RG} ${ref} ${fq1} ${fq2} | samtools view -bh -f 0x0003 -F 0x0004 -o ${of1}.0.bam -
+
+## Sort and index the BAM file
+samtools sort -@ 7 -m 512M ${of1}.0.bam -o ${of1}.bam
+samtools index ${of1}.bam
+
+## Remove temporary files
+rm ${of1}.0.bam
+
+
+####################################################################################
+## 22/07/12                                                                       ##
+## 2. Remove duplicates using Picard Markduplicates and then apply -q30 filter    ##
+####################################################################################
+
+cd /home/projects1/Ellobium/rawBAM_220711/
+
+pt1=($(pwd)"/")
+listf=${pt1}"Ellobium_fastq_list_220711.txt"
+scf=${pt1}"dup_removal_220712.sh"
+
+## The number of jobs to be run at a time
+## Each job takes only 2 cores: let's run all jobs in one run
+nind=($(tail -n +2 ${listf} | wc -l))
+nval=${nind}
+
+## Submit the job (run Picard MarkDuplicates for raw BAM data) as a job array
+sbatch --array=1-${nind}%${nval} -J duprem -c 2 --mem 3750 --wrap=${scf}" "${listf}
+
+## Remove unnecessary files after finishing all jobs
+rm slurm-*
+
+
+#################################################################
+## Save the following script as "dup_removal_220712.sh"        ##
+
+#!/bin/bash
+
+pt1=($(pwd)"/")
+
+listf=$1
+inum=$SLURM_ARRAY_TASK_ID
+
+## Retrieve individual ID
+iid=($(tail -n +2 ${listf} | head -${inum} | tail -1 | awk '{print $3}'))
+
+picard="/usr/bin/java -Xmx2048m "
+picard+="-jar /opt/ohpc/pub/apps/picardtools/2.27.1/picard.jar MarkDuplicates"
+picardstr="REMOVE_DUPLICATES=true ASSUME_SORTED=true "
+picardstr+="MAX_FILE_HANDLES_FOR_READ_ENDS_MAP=1000 VALIDATION_STRINGENCY=LENIENT"
+
+inbam=${iid}".mapped"
+of1=${inbam}".rmdup"
+of2=${inbam}".rmdup.q30"
+
+cd ${pt1}${iid}/
+
+## Remove Duplicates
+${picard} INPUT=${inbam}.bam OUTPUT=${of1}.bam METRICS_FILE=${of1}.metric.txt ${picardstr} TMP_DIR=${pt1}${grp}/ &> ${of1}.log1
+samtools index ${of1}.bam
+
+## Apply quality filter
+samtools view -bh -q30 -o ${of2}.bam ${of1}.bam
+samtools index ${of2}.bam
+
+
+##########################################################
+## 22/07/13                                             ##
+## 3. Calculate per-individual coverage using qualimap  ##
+##########################################################
+
+cd /home/projects1/Ellobium/
+
+mkdir -p ./analysis/qualimap_220713; cd ./analysis/qualimap_220713
+
+pt1=($(pwd)"/")
+listf="/home/projects1/Ellobium/rawBAM_220711/Ellobium_fastq_list_220711.txt"
+of1=${pt1}"Ellobium_qualimap_220713.txt"
+jfn="qualimap"
+njobs=5 ## The number of jobs to be run at a time
+
+## Make directories
+while read pid; do mkdir -p ./${pid}; done < <(tail -n +2 ${listf} | awk '{print $3}')
+
+## Write bash files 
+for cnum in $(seq 1 $njobs); do echo -e '#!/bin/bash\n' > ${jfn}_${cnum}.sh; chmod 755 ${jfn}_${cnum}.sh; done
+
+## Write command lines into the bash files
+cnum=1
+while read iid; do
+    bam=($(realpath ../../rawBAM_220711/${iid}/${iid}.mapped.rmdup.q30.bam))
+    CMD="qualimap bamqc -bam "${bam}" -nt 8 -outdir ./"${iid}
+    CMD+=" -outformat HTML --java-mem-size=12G"
+    CMD+="; mv ./"${iid}"/genome_results.txt ./"${iid}"/"${iid}".mapped.rmdup.q30.qualimap.txt"
+    echo ${CMD} >> ${jfn}_${cnum}.sh
+    let cnum+=1; if [ "$cnum" -gt "$njobs" ]; then let cnum-=${njobs}; fi
+done < <(tail -n +2 ${listf} | awk '{print $3}')
+
+## Run qualimap
+for cnum in $(seq 1 $njobs); do
+    sbatch -c 12 --mem 22500 -J qualimap ${jfn}_${cnum}.sh
+done
+
+
+##################################################
+## 22/07/13                                     ##
+## 4. Run mapDamage to check the overall match  ##
+##################################################
+
+cd /home/projects1/Ellobium/analysis/
+
+mkdir -p ./mapDamage_220713/; cd ./mapDamage_220713/
+
+pt1=($(pwd)"/")
+listf="/home/projects1/Ellobium/rawBAM_220711/Ellobium_fastq_list_220711.txt"
+reff="/home/projects1/Ellobium/FastQ/Reference_assembly/Elch_new_over2000.fa"
+of1="Ellobium.mapDamage.220713.txt"
+nrmax=100000
+
+## Make directories
+while read pid; do mkdir -p ./${pid}; done < <(tail -n +2 ${listf} | awk '{print $3}')
+
+jfn="mapDamage"
+njobs=5  ## The number of jobs to be run at a time
+
+## Write bash files
+for cnum in $(seq 1 $njobs); do echo -e '#!/bin/bash\n' > ${jfn}_${cnum}.sh; chmod 755 ${jfn}_${cnum}.sh; done
+
+## Run mapDamage using whole BAM files (subsample to 100K)
+## Write command lines into the bash files
+cnum=1
+while read iid; do
+    bam=($(realpath ../../rawBAM_220711/${iid}/${iid}.mapped.rmdup.q30.bam))
+    CMD="mapDamage -i "${bam}" -r "${reff}" -d ./"${iid}"/"
+    CMD+=" --merge-reference-sequences --no-stat -t "${iid}
+    CMD+=" -n "${nrmax}
+    echo ${CMD} >> ${jfn}_${cnum}.sh
+    let cnum+=1; if [ "${cnum}" -gt "${njobs}" ]; then let cnum-=${njobs}; fi
+done < <(tail -n +2 ${listf} | awk '{print $3}')
+
+## Submit the job to slurm
+for cnum in $(seq 1 $njobs); do
+    sbatch -c 8 --mem 15000 -J mapDamage ${jfn}_${cnum}.sh
+done
+
+## Retrieve the numbers
+echo -e 'Sample\tDMG51\tDMG52\tDMG31\tDMG32' > ${of1}
+while read iid; do
+    tfn1="./"${iid}"/5pCtoT_freq.txt"
+    tfn2="./"${iid}"/3pGtoA_freq.txt"
+    tnum1=($(head -2 ${tfn1} | tail -1 | awk '{print $2}'))
+    tnum2=($(head -3 ${tfn1} | tail -1 | awk '{print $2}'))
+    tnum3=($(head -2 ${tfn2} | tail -1 | awk '{print $2}'))
+    tnum4=($(head -3 ${tfn2} | tail -1 | awk '{print $2}'))
+    echo -e ${iid}"\t"${tnum1}"\t"${tnum2}"\t"${tnum3}"\t"${tnum4} >> ${of1}
+done < <(tail -n +2 ${listf} | awk '{print $3}')
+
+## Retrieve mapDamage plots
+while read iid; do
+    cp ./${iid}/Fragmisincorporation_plot.pdf ./${iid}_frag_plot.pdf
+done < <(tail -n +2 ${listf} | awk '{print $3}')
+
+## Merge plots
+pdfunite *_frag_plot.pdf Ellobium_frag_plot_merged_220713.pdf
+rm *_frag_plot.pdf
+
+## Remove temporary files after the jobs are finished
+rm slurm-*
+
+
+##############################################
+## 22/07/13                                 ##
+## 5. Create a summary file per individual  ##
+##############################################
+
+cd /home/projects1/Ellobium/
+
+pt1=($(pwd)"/")
+listf="/home/projects1/Ellobium/rawBAM_220711/Ellobium_fastq_list_220711.txt"
+of1="Ellobium.summary_220713.txt"
+scf1=${pt1}"summary_statistics_220713.sh"
+
+## Write the summary file
+echo -e ID'\t'nr.all_fq1'\t'nr.all_fq2'\t'nr.mapped'\t'pr.mapped'\t'nr.uniq'\t'CF'\t'nr.q30'\t'pr.q30'\t'GC'\t'mn.cov'\t'sd.cov'\t'pr.error'\t'TCorAG > ${of1}
+
+## The number of jobs to be run at a time
+nind=$(tail -n +2 ${listf} | wc -l)
+nval=${nind}
+
+## Submit the job as a job array
+sbatch --array=1-${nind}%{nval} -c 4 --mem 7500 -J ElloSum --wrap=${scf1}" "${listf}" "${of1}
+
+## Sort the result
+head -1 ${of1} > temp_${of1}
+tail -n +2 ${of1} | sort -k 1,1 >> temp_${of1}
+mv temp_${of1} ${of1}
+
+##################################################################
+## Save the following script as "summary_statistics_220713.sh"  ##
+
+#!/bin/bash
+
+pt1=($(pwd)"/")
+listf=$1
+of1=$2
+inum=$SLURM_ARRAY_TASK_ID
+
+## Retrieve individual ID and fastq files
+iid=($(tail -n +2 ${listf} | head -${inum} | tail -1 | awk '{print $3}'))
+fq1=($(tail -n +2 ${listf} | head -${inum} | tail -1 | awk '{print $2"_1.fq.gz"}'))
+fq2=($(tail -n +2 ${listf} | head -${inum} | tail -1 | awk '{print $2"_2.fq.gz"}'))
+
+n11=$(zcat ${fq1} | wc -l | awk '{print $1/4}')   ## the number of sequenced forward read
+echo "Counting FastQ_1 reads is done"
+n12=$(zcat ${fq2} | wc -l | awk '{print $1/4}')   ## the number of sequenced reverse read
+echo "Counting FastQ_2 reads is done"
+n13=$(samtools view -c ./rawBAM_220711/${iid}/${iid}.mapped.bam)    ## paired and mapped reads
+echo "Counting mapped reads is done"
+n14=$(samtools view -c ./rawBAM_220711/${iid}/${iid}.mapped.rmdup.bam)     ## unique reads
+echo "Counting unique reads is done"
+n15=$(samtools view -c ./rawBAM_220711/${iid}/${iid}.mapped.rmdup.q30.bam) ## unique q30 reads
+echo "Counting unique q30 reads is done"
+n21=$(awk '{if ($0 ~ /GC/) print $NF}' ./analysis/qualimap_220713/${iid}/${iid}.mapped.rmdup.q30.qualimap.txt | sed s/"%"/""/g)        ## GC content
+n22=$(awk '{if ($0 ~ /mean cov/) print $NF}' ./analysis/qualimap_220713/${iid}/${iid}.mapped.rmdup.q30.qualimap.txt | sed s/"X"/""/g)  ## mean coverage
+n23=$(awk '{if ($0 ~ /std cov/) print $NF}' ./analysis/qualimap_220713/${iid}/${iid}.mapped.rmdup.q30.qualimap.txt | sed s/"X"/""/g)  ## SD coverage
+n24=$(awk '{if ($0 ~ /general error/) print $NF}' ./analysis/qualimap_220713/${iid}/${iid}.mapped.rmdup.q30.qualimap.txt | sed s/"X"/""/g)  ## general error rate
+## Calculate overall T-->C and A-->G mismatch rate as a distance from the ref seq
+n31=$(tail -n +5 ./analysis/mapDamage_220713/${iid}/misincorporation.txt | awk 'BEGIN {n1=0; n2=0} {n1+=$5+$8; n2+=$12+$13} END {if (n1 == 0) print "NA"; else print n2/n1}')
+echo ${iid} ${n11} ${n12} ${n13} ${n14} ${n15} ${n21} ${n22} ${n23} ${n24} ${n31} | \
+awk '{if ($4 > 0) print $1,$2,$3,$4,$4/($2*2),$5,$4/$5,$6,$6/$5,$7,$8,$9,$10,$11}' >> ${of1}
+
+
+#######################################################################
+## 6. Run the first step of HaplotypeCaller (-T HaplotypeCaller)     ##
+#######################################################################
+
+cd /home/projects1/Ellobium/
+
+mkdir -p ./VCF_220826/; cd ./VCF_220826/
+
+pt1=($(pwd)"/")
+listf="/home/projects1/Ellobium/rawBAM_220711/Ellobium_fastq_list_220711.txt"
+reff="/home/projects1/Ellobium/FastQ/Reference_assembly/Elch_new_over2000.fa"
+scaff1=${pt1}"scaffold_list_220826_1.txt"
+scaff2=${pt1}"scaffold_list_220826_2.txt"
+scf=${pt1}"run_haplotypecaller_220826.sh"
+
+## Make directories
+while read pid; do mkdir -p ./${pid}; done < <(tail -n +2 ${listf} | awk '{print $3}')
+
+## Make scaffold lists
+## 1-500 : 20 scaffolds per one list / 501-10059 : 2000 scaffolds per one list
+for i in {1..500}; do
+    echo "scaffold"$i >> ${scaff1}
+done
+for i in {501..10059}; do
+    echo "scaffold"$i >> ${scaff2}
+done
+jfn="scaffold_segment_"
+split -l 20 -d -a 2 --numeric-suffixes=1 --additional-suffix=.list ${scaff1} ${jfn}
+split -l 2000 -d -a 2 --numeric-suffixes=26 --additional-suffix=.list ${scaff2} ${jfn}
+
+## The number of jobs to be run at a time
+nrun=$(ls ${jfn}* | wc -l)
+nval=5
+
+## Submit the job as a job array
+## Run four individuals in normal node, and run the rest in amd
+for iid in $(tail -n +2 ${listf} | awk '{print $3}' | tail -n +13 | head -2); do
+    sbatch --array=1-${nrun}%${nval} -c 12 --mem 22500 -J ElloHaplo --wrap=${scf}" "${iid}" "${reff}" "${jfn}
+done
+for iid in $(tail -n +2 ${listf} | awk '{print $3}' | tail -1); do
+    sbatch --array=1-${nrun}%${nval} -p amd -c 12 --mem 22500 -J ElloHaplo --wrap=${scf}" "${iid}" "${reff}" "${jfn}
+done
+
+## Remove unnecessary files after finishing all jobs
+rm slurm-*
+
+## Check which gvcf file is truncated
+while read fn; do
+    echo -e '\n'${fn}
+    bcftools view -h ${fn} | head -1
+done < <(ls ./*/*.g.vcf.gz) > truncatecheck.txt
+
+
+###################################################################
+## Save the following script as "run_haplotypecaller_220826.sh"  ##
+
+#!/bin/bash
+
+pt1=($(pwd)"/")
+
+iid=$1
+ref=$2    ## Reference genome file
+jfn=$3
+inum=$SLURM_ARRAY_TASK_ID
+
+## Retrieve scaffold list file
+scaff=($(ls ${pt1}${jfn}* | head -${inum} | tail -1))
+
+## Get the input BAM file
+inbam=($(realpath ../rawBAM_220711/${iid}/${iid}.mapped.rmdup.q30.bam))
+gvcf="./"${iid}"/"${iid}".mapped.rmdup.q30"
+
+GATKstr="java -Xmx10G -jar /opt/ohpc/pub/apps/gatk/gatk-3.8.1.0/GenomeAnalysisTK.jar"
+GATKopt="-ERC GVCF -variant_index_type LINEAR -variant_index_parameter 128000"
+GATKopt+=" -rf BadCigar -mbq 30 -nct 2"
+
+## Run HaplotypeCaller to call variants and create GVCF
+${GATKstr} -T HaplotypeCaller -R ${ref} -I ${inbam} -o ${gvcf}.${inum}.g.vcf.gz ${GATKopt} -L ${scaff}
+
+
+################################################################################
+## 7. Run CombineGVCFs to merge GVCFs into a single file (Total 15 samples)   ##
+################################################################################
+
+cd /home/projects1/Ellobium/VCF_220826/; mkdir -p ./combined/
+
+pt1=($(pwd)"/")
+listf="/home/projects1/Ellobium/rawBAM_220711/Ellobium_fastq_list_220711.txt"
+reff="/home/projects1/Ellobium/FastQ/Reference_assembly/Elch_new_over2000.fa"
+scf=${pt1}"run_gatk_combinegvcfs_220902.sh"
+
+## Merge all GVCFs across all individuals
+for nscaff in {1..15}; do
+    invcfs=""
+    while read iid; do
+        tvcf=($(realpath ./${iid}/${iid}.mapped.rmdup.q30.${nscaff}.g.vcf.gz))
+        if [[ "$invcfs" == "" ]]; then invcfs+=${tvcf}; else invcfs+=","${tvcf}; fi
+    done < <(tail -n +2 ${listf} | awk '{print $3}')
+    CMD=${scf}" "${invcfs}" "${nscaff}" "${reff}
+    sbatch -J combineGVCFs -p amd -c 8 --mem 10000 --wrap="$CMD"
+done
+
+for nscaff in {16..30}; do
+    invcfs=""
+    while read iid; do
+        tvcf=($(realpath ./${iid}/${iid}.mapped.rmdup.q30.${nscaff}.g.vcf.gz))
+        if [[ "$invcfs" == "" ]]; then invcfs+=${tvcf}; else invcfs+=","${tvcf}; fi
+    done < <(tail -n +2 ${listf} | awk '{print $3}')
+    CMD=${scf}" "${invcfs}" "${nscaff}" "${reff}
+    sbatch -J combineGVCFs -c 8 --mem 10000 --wrap="$CMD"
+done
+
+## Remove unnecessary files after finishing all jobs
+rm slurm-*
+
+
+#############################################################
+## Save the following as "run_gatk_combinegvcfs_220902.sh" ##
+
+#!/bin/bash
+
+pt1=($(pwd)"/")
+
+lf1=$1  ## A comma separated list of GVCFs
+nscaff=$2  ## Number of scaffold segment
+reff=$3  ## Reference FastA file
+
+multigvcf="./combined/Ellobium.mapped.rmdup.q30."${nscaff}
+
+## Create a string of input vcf for the combineGVCFs module
+vcfstr=""
+for invcf in $(echo ${lf1} | sed s/","/" "/g); do
+    vcfstr+=" -V "${invcf}
+done
+
+GATKstr="java -Xmx8G -jar /opt/ohpc/pub/apps/gatk/gatk-3.8.1.0/GenomeAnalysisTK.jar"
+
+## Merge all GVCFs into a single file
+${GATKstr} -T CombineGVCFs -R ${reff} ${vcfstr} -o ${multigvcf}.g.vcf.gz
+
+
+############################################################
+## 8. Run GenotypeGVCFs to perform joint genotyping       ##
+############################################################
+
+cd /home/projects1/Ellobium/VCF_220826/
+
+pt1=($(pwd)"/")
+reff="/home/projects1/Ellobium/FastQ/Reference_assembly/Elch_new_over2000.fa"
+scf=${pt1}"run_gatk_genotypegvcfs_220903.sh"
+nscaff=30 ## Number of scaffold segments
+
+## The number of jobs to be run at a time
+nrun=${nscaff}
+nval=15
+
+sbatch --array=1-15%${nval} -J genotypeGVCFs -c 8 --mem 15000 -p amd --wrap=${scf}" "${reff}
+sbatch --array=16-${nscaff}%${nval} -J genotypeGVCFs -c 8 --mem 15000 --wrap=${scf}" "${reff}
+
+## Remove temporary files after the jobs are finished
+rm slurm-*
+
+
+###############################################################
+## Save the following as "run_gatk_genotypegvcfs_220903.sh"  ##
+
+#!/bin/bash
+
+pt1=($(pwd)"/")
+
+reff=$1  ## Reference FastA file
+nscaff=$SLURM_ARRAY_TASK_ID
+
+multigvcf="./combined/Ellobium.mapped.rmdup.q30."${nscaff}
+
+GATKstr="java -Xmx8G -jar /opt/ohpc/pub/apps/gatk/gatk-3.8.1.0/GenomeAnalysisTK.jar"
+
+## Run GenotypeGVCFs to create all site genotype calls
+${GATKstr} -T GenotypeGVCFs -R ${reff} -V ${multigvcf}.g.vcf.gz -o ${multigvcf}.vcf.gz -stand_call_conf 20.0
+
+
+##########################################################
+## 9_1. Extract high-quality SNPs in VCF files          ##
+##      using SelectVariants                            ##
+##########################################################
+
+cd /home/projects1/Ellobium/VCF_220826/
+
+## Make directories
+mkdir -p ./VCF_filtering/; cd ./VCF_filtering/
+
+pt1=($(pwd)"/")
+ref="/home/projects1/Ellobium/FastQ/Reference_assembly/Elch_new_over2000.fa"
+fn1="/home/projects1/Ellobium/VCF_220826/combined/Ellobium.mapped.rmdup.q30."
+of1="Ellobium.biSNP.q30"
+tn1="temp1_"${of1}
+nscaff=30  ## the number of scaffold segments
+scf1=${pt1}"filter_q30_biSNPs_script_220905.sh"
+
+idnmax=${nscaff}
+nperrun=15
+
+## Run the job as a job array
+sbatch --array=1-${idnmax}%${nperrun} -J VariantFilter -c 8 --mem 15000 -p amd --wrap=${scf1}" "${fn1}" "${of1}" "${ref}
+
+## Remove unnecessary files
+rm slurm-*
+
+
+########################################################################
+## Save the following script as "filter_q30_biSNPs_script_220905.sh"  ##
+
+#!/bin/bash
+
+fn1=$1   ## input VCF prefix
+of1=$2   ## output VCF prefix
+ref=$3   ## Reference fasta
+
+nscaff=$SLURM_ARRAY_TASK_ID
+
+invcf=${fn1}${nscaff}".vcf.gz"
+ovcf=${of1}"."${nscaff}
+tn1="temp1_"${ovcf}
+
+## Take SNPs with QUAL >= 30
+gatk --java-options '-Xmx8G' SelectVariants -V ${invcf} -R ${ref} \
+    -select "QUAL >= 30.0" --select-type-to-include SNP -O ${tn1}_1.vcf
+
+## Remove deletions and multi-allelic SNPs
+## and then reformat into the gzipped format
+cat ${tn1}_1.vcf | \
+    awk '{if ($0 ~ /^#/) print $0;
+          else if (($4 == "A" || $4 == "C" || $4 == "G" || $4 == "T") && ($5 == "A" || $5 == "C" || $5 == "G" || $5 == "T")) print $0}' | \
+    bcftools view -O z -o ${ovcf}.vcf.gz
+
+## Index the output VCF file
+gatk IndexFeatureFile -F ${ovcf}.vcf.gz
+
+## For scaffold segment 2, extract variant statistics
+if [ "$nscaff" -eq 2 ]; then
+    echo 'CHROM POS REF ALT QUAL DP QD SOR FS MQ MQRankSum ReadPosRankSum ExcessHet AN AC' | sed s/" "/"\t"/g > ${ovcf}.txt
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%QUAL\t%DP\t%QD\t%SOR\t%FS\t%MQ\t%MQRankSum\t%ReadPosRankSum\t%ExcessHet\t%AN\t%AC\n' \
+        ${ovcf}.vcf.gz >> ${ovcf}.txt
+    gzip ${ovcf}.txt
+fi
+
+## Remove temporary files
+rm ${tn1}_*
+
+
+########################################################
+## 9_2. Filter variants according to thresholds       ##
+##      using VariantsFiltration                      ##
+########################################################
+
+cd /home/projects1/Ellobium/VCF_220826/VCF_filtering/
+
+pt1=($(pwd)"/")
+ref="/home/projects1/Ellobium/FastQ/Reference_assembly/Elch_new_over2000.fa"
+fn1="/home/projects1/Ellobium/VCF_220826/VCF_filtering/Ellobium.biSNP.q30."
+of1="Ellobium.filtered."
+of2="Ellobium.filtered_passed."
+nscaff=30  ## the number of scaffold segments
+scf1=${pt1}"run_VariantsFiltration_220907.sh"
+
+idnmax=${nscaff}
+nperrun=15
+
+## Run the job as a job array
+sbatch --array=1-15%${nperrun} -J VariantFiltration -p amd -c 8 --mem 15000 --wrap=${scf1}" "${fn1}" "${of1}" "${of2}" "${ref}
+sbatch --array=16-${idnmax}%${nperrun} -J VariantFiltration -c 8 --mem 15000 --wrap=${scf1}" "${fn1}" "${of1}" "${of2}" "${ref}
+
+## Remove unnecessary files
+rm slurm-*
+
+
+#################################################################
+## Save the following as "run_VariantsFiltration_220907.sh"    ##
+
+#!/bin/bash
+
+fn1=$1   ## input VCF prefix
+of1=$2   ## output VCF prefix
+of2=$3   ## filter passed output VCF prefix
+ref=$4   ## Reference fasta
+
+nscaff=$SLURM_ARRAY_TASK_ID
+
+invcf=${fn1}${nscaff}".vcf.gz"
+ovcf=${of1}${nscaff}".vcf.gz"
+ovcf2=${of2}${nscaff}".vcf.gz"
+
+## Filter variants according to thresholds
+## DP filter is <1/5x, >5x, mean(x) = 679.5
+gatk --java-options '-Xmx8G' VariantFiltration -V ${invcf} -R ${ref}\
+        -filter "DP < 136.0 || DP > 3400.0 || QD < 2.0 || SOR > 3.0 || FS > 60.0 || MQ < 40.0 || MQRankSum < -12.5 || ReadPosRankSum < -8.0 || ExcessHet > 10.0" \
+        --filter-name "LowQual" -O ${ovcf}
+## Index the output VCF file
+gatk IndexFeatureFile -F ${ovcf}.vcf.gz
+
+## Keep the passed variants only
+bcftools view -i "%FILTER='PASS'" -O z -o ${ovcf2} ${ovcf}
+## Index the output VCF file
+gatk IndexFeatureFile -F ${ovcf2}.vcf.gz
+
+
+###################################################################
+## 10. Filter genotype with genotype likelihood thresholds       ##
+###################################################################
+
+cd /home/projects1/Ellobium/VCF_220826/VCF_filtering/
+mkdir ./PL_filter; cd ./PL_filter
+
+pt1=($(pwd)"/")
+fn1="/home/projects1/Ellobium/VCF_220826/VCF_filtering/Ellobium.filtered_passed"  ## Input VCF prefix
+of1="Ellobium.filtered_passed"
+pyscript="/home/projects1/internship/hcgill/PythonCode/Planthopper/VCF_genotype_filtering_220530.py"
+scf1=${pt1}"variant_genotyping.sh"
+nscaff=30
+
+## Variant genotyping
+for cutoff in 0.99 0.95 0.9; do
+    sbatch --array=1-${nscaff}%2 -c 4 --mem 7500 -p amd --wrap="${scf1} ${pyscript} ${fn1} ${cutoff}"
+done
+
+## Count whole SNPs
+for i in {1..30};
+    do new=$(cat Ellobium.filtered_passed.${i}.vcf.PL99 | wc -l)
+    var=$(expr $var + $new)
+done
+echo ${var}
+
+
+## I moved the filtered vcfs to new subdirectories to for convenience
+cd ../
+mkdir biSNP
+mkdir filtered
+
+mv Ellobium.biSNP.q30.*.vcf.gz* ./biSNP/
+mv Ellobium.filtered.*.vcf.gz* ./filtered/
+mv Ellobium.biSNP.q30.2.txt.gz ./biSNP
+mv *.PL* ./PL_filter/
+
+## I decided to use cutoff 0.99, because the number of SNPs which have 0 missing individual is 4,773,083 for cutoff 0.99 in scaffold set 1.
+
+
+##################################################
+##   Save following as "variant_genotyping.sh"  ##
+
+#!/bin/bash
+
+pyscript=$1
+fn1=$2
+cutoff=$3
+nscaff=$SLURM_ARRAY_TASK_ID
+
+python ${pyscript} ${fn1}.${nscaff}.vcf.gz ${cutoff} PL
+
+
+#####################################################################
+## Save the following as "VCF_genotype_filtering_220530.py"        ##
+## This code is written for genotyping and filtering the VCF file from PL(phred scaled genotype likelihood)
+## Rewritten by Haechan in 220530 (reused VCF_genotype_filtering.py)
+
+
+# Import modules
+import sys
+import gzip
+import time
+
+
+# INPUT
+INPUT = sys.argv[1]
+#INPUT="/home/projects1/Planthopper/GBS_Processing/Nilaparvata_lugens/VCF_filtering_batch2/test.vcf.gz"
+GL_CUTOFF = float(sys.argv[2])
+#GL_CUTOFF = 0.99
+CRITERIA = sys.argv[3]   # PP or PL
+OUTPUT=INPUT.replace('gz','') + CRITERIA + str(int(GL_CUTOFF*100))
+
+# Global variables
+
+GENOTYPE = [2,1,0,9] # count reference allele
+# main
+
+def main():
+    start_time = time.time()
+    outfile = open(OUTPUT, 'w')
+    print('Trying to open file')
+    gzip_file = gzip.open(INPUT, 'r')
+    print('Open file')
+    i = 0
+    print('start parsing')
+    while True:
+        line = gzip_file.readline()
+        if not line:
+            break
+        line = line.decode()
+        if line[0:2] == "##":
+            continue
+        elif line[0] == "#":
+            VCF_header=line.replace('#', '').replace('\n', '').split('\t')
+            Individual = VCF_header[9:]
+        else:
+            variant_data = line.replace('\n', '').split('\t')
+            formatNum = len(variant_data[VCF_header.index('FORMAT')].split(':'))  # e.g. GT:AD:DP....
+            criteria_index = variant_data[VCF_header.index('FORMAT')].split(':').index(CRITERIA)
+            geno = ''
+            for ind in Individual:
+                geno_field = variant_data[VCF_header.index(ind)].split(':')
+                if len(geno_field) != formatNum or geno_field[criteria_index] == ".":
+                    geno += str(9)
+                else:
+                    GL_list = Cal_GL(geno_field[criteria_index])
+                    GL_val = [i for i, GL in enumerate(GL_list) if GL >= GL_CUTOFF]
+                    GL_val.append(3)  # if there is no GL larger than GL_CUTOFF then we have to impute genotype as missing
+                    geno += str(GENOTYPE[GL_val[0]])
+            print(geno, geno.count('9'), sep="\t", file=outfile)
+            i += 1
+            if i % 10000 == 0:
+                print(f"{i}th SNP processed")
+    outfile.close()
+    end_time = time.time()
+    take_time = round((end_time-start_time)/60,2)
+    print(f"It takes {take_time} min")
+
+    return None
+
+def Cal_GL(Pscore):
+    score_list = []
+    for prob in Pscore.split(','):
+        score_list.append(10**-(0.1*int(prob)))
+    return [score/sum(score_list) for score in score_list]  # normalize
+
+
+main()
+
+
+########################################################
+## 11. Convert output in the EIGENSTRAT format        ##
+########################################################
+
+cd /home/projects1/Ellobium/
+
+mkdir -p ./PL_genotypes/; cd ./PL_genotypes/
+
+pt1=($(pwd)"/")
+fn1="/home/projects1/Ellobium/VCF_220826/VCF_filtering/PL_filter/Ellobium.filtered_passed"
+ivcf="/home/projects1/Ellobium/VCF_220826/VCF_filtering/Ellobium.filtered_passed" ## input vcf
+of1="Ellobium.biSNP.q30.PL99"
+scf1=${pt1}"make_snp_file_220921.sh"
+tn1="temp1_"${of1}
+
+## Make .geno and .ind file
+for nscaff in {1..30}; do
+    awk '{print $1}' "${fn1}.${nscaff}.vcf.PL99" >> ${of1}.geno
+    echo "scaffold set ${nscaff} is done"
+done
+bcftools view -h ${ivcf}.1.vcf.gz | tail -1 | awk '{OFS="\t"} {for (i=10; i <= NF; i++) print $i,"F",$i}' > ${of1}.ind
+
+## Make .snp file
+idnmax=30
+nperrun=15
+sbatch --array=1-${idnmax}%${nperrun} -p amd -c 4 --mem 7500 --wrap=${scf1}" "${ivcf}" "${of1}
+
+for nscaff in {1..30}; do
+    cat ${tn1}"."${nscaff} >> ${of1}.snp
+    echo "scaffold${nscaff} is done"
+done
+
+## Remove temporary files
+rm ${tn1}*
+rm slurm-*
+
+## Calculate missingness per individual
+echo -e "individual_number\tmissingness" > missingness_per_individual.txt
+for i in {1..15}; do
+    num1=$(cut -c $i /home/projects1/Ellobium/PL_genotypes/Ellobium.biSNP.q30.PL99.geno | grep 9 | wc -l)
+    num2=$(cat /home/projects1/Ellobium/PL_genotypes/Ellobium.biSNP.q30.PL99.geno | wc -l)
+    pp=$(echo "scale=3; ${num1} / ${num2}" | bc)
+    echo -e "${i}\t${pp}" >> missingness_per_individual.txt
+    echo "Individual ${i} is done"
+done
+
+## Make GL>=0.99 and missingness=0 filtered eigenstrat files
+cp ${of1}.ind ${of1}.filtered.ind
+grep -v 9 ${of1}.geno > ${of1}.filtered.geno
+paste ${of1}.geno ${of1}.snp | awk -v OFS="\t" '{if ($1 !~ 9) print $2,$3,$4,$5,$6,$7}' > ${of1}.filtered.snp 
+
+
+################################################################
+## Save the following as "make_snp_file_220921.sh"            ##
+
+#!/bin/bash
+
+pt1=($(pwd)"/")
+ivcf=$1
+of1=$2
+
+inum=$SLURM_ARRAY_TASK_ID
+tn1="temp1_"${of1}"."${inum}
+
+zcat "${ivcf}.${inum}.vcf.gz" | grep -v '^#' | sed 's/^scaffold//g' | awk -v OFS="\t" '{print $1":"$2":"$4":"$5,$1,0,$2,$4,$5}' > ${tn1}
+
+
+###################################################################
+## 12. Calculate allele frequency from 36M SNP set               ##
+##     and filter out mac <= 1 and alt-homo doubleton alleles    ##
+###################################################################
+
+cd /home/projects1/Ellobium/PL_genotypes/
+
+pt1=($(pwd)"/")
+fn1=${pt1}"Ellobium.biSNP.q30.PL99.filtered"
+of1="Ellobium.biSNP.q30.PL99.filtered"
+tn1="temp_${of1}"
+#nchr=1
+
+## Count the numbers of "2", "1", "0" genotypes
+## and the numbers of reference and alternative alleles for each SNP
+echo -e "n2\tn1\tn0\tnref\tnalt" > ${of1}.snp.frq
+awk -v FS="" -v OFS="" '{KR03=$11; $11=""; print KR03,$0}' ${fn1}.geno | awk -v FS="" -v OFS="\t" '{nref=0; nhet=0; nalt=0; for (i=2;i<=NF;i++) {if ($i == 2) nref+=1;
+    else if ($i == 1) nhet+=1; else if ($i == 0) nalt+=1} print nref,nhet,nalt,2*nref+nhet,nhet+2*nalt}' >> ${of1}.snp.frq
+
+## Count the alternative allele site frequency spectrum
+echo -e "alt_count\tn" > ${of1}.alt.frq
+awk '{print $5}' ${of1}.snp.frq | tail -n +2 | sort -k1,1n | uniq -c | awk '{OFS="\t"} {print $2,$1}' >> ${of1}.alt.frq
+
+## Count the folded site frequency spectrum (minor allele SFS)
+echo -e "mac\tn" > ${of1}.maf.frq
+awk '{if ($4 > $5) print $5; else print $4}' ${of1}.snp.frq | tail -n +2 | sort -k1,1n | uniq -c | awk '{OFS="\t"} {print $2,$1}' >> ${of1}.maf.frq
+
+## Count alternative homozygote doubleton allele
+awk '{if ($5 == 2 && $3 == 1) print $0}' ${of1}.snp.frq | wc -l
+
+## Make mac <= 1 and alt-homo doubleton filtered eigenstrat files
+tail -n +2 ${of1}.snp.frq > ${tn1}_1
+paste ${fn1}.geno ${tn1}_1 | awk '{if ($5 > $6) mac=$6; else mac=$5; if (mac > 1) print $0}' | awk '{if ($4 == 1 && $6 == 2) skip; else print $1}' > ${of1}.mac1.geno
+paste ${fn1}.snp ${tn1}_1 | awk '{if ($10 > $11) mac=$11; else mac=$10; if (mac > 1) print $0}' | awk -v OFS="\t" '{if ($9 == 1 && $11 == 2) skip; else print $1,$2,$3,$4,$5,$6}' > ${of1}.mac1.snp
+grep -v "Elch_KR_03" ${fn1}.18M.2.ind > ${of1}.mac1.ind
+
+## Count the numbers of "2", "1", "0" genotypes of 18M SNP set (230211)
+## and the numbers of reference and alternative alleles for each SNP
+echo -e "n2\tn1\tn0\tnref\tnalt" > ${of1}.mac1.snp.frq
+awk -v FS="" -v OFS="" '{KR03=$11; $11=""; print KR03,$0}' ${fn1}.mac1.geno | awk -v FS="" -v OFS="\t" '{nref=0; nhet=0; nalt=0; for (i=2;i<=NF;i++) {if ($i == 2) nref+=1;
+    else if ($i == 1) nhet+=1; else if ($i == 0) nalt+=1} print nref,nhet,nalt,2*nref+nhet,nhet+2*nalt}' >> ${of1}.mac1.snp.frq
+
+## Count the alternative allele site frequency spectrum of 18M SNP set (230211)
+echo -e "alt_count\tn" > ${of1}.mac1.alt.frq
+awk '{print $5}' ${of1}.mac1.snp.frq | tail -n +2 | sort -k1,1n | uniq -c | awk '{OFS="\t"} {print $2,$1}' >> ${of1}.mac1.alt.frq
+
+## Count the folded site frequency spectrum of 18M SNP set (minor allele SFS) (230211)
+echo -e "mac\tn" > ${of1}.mac1.maf.frq
+awk '{if ($4 > $5) print $5; else print $4}' ${of1}.mac1.snp.frq | tail -n +2 | sort -k1,1n | uniq -c | awk '{OFS="\t"} {print $2,$1}' >> ${of1}.mac1.maf.frq
+
+## Remove temporary files
+rm ${tn1}_*
+
+
+#####################################################################
+##  13. Run PCA to detect population structure                     ##
+##      using mac <= 1 and alt-homo doubleton filtered SNP set     ##
+##      calculating PC without Elch_KR_03                          ##
+#####################################################################
+
+cd /home/projects1/Ellobium/analysis/
+
+mkdir -p ./PCA_220928/; cd ./PCA_220928/
+
+pt1=($(pwd)"/")
+fn1="/home/projects1/Ellobium/PL_genotypes/Ellobium.biSNP.q30.PL99.filtered.mac1"
+idf1=${fn1}".ind"
+of1="PCA_220928_18M"
+
+parf=${of1}".par"
+tn1="temp1_"${of1}
+
+nchr=1
+
+## Change .snp file: chromosome number to all 1 and physical distance as NR
+awk -v FS=":" -v OFS=":" '{print 1,NR,$3,$4}' ${fn1}.snp | awk -v OFS="\t" '{print $1,1,$3,NR,$5,$6}' > ${fn1}.chr1.snp
+
+## Update breed information
+awk '{print $3}' ${idf1} | grep -v "Elch_KR_03" | sort | uniq > ${of1}.pops
+
+## Write down parameter files
+echo "genotypename: "${fn1}."geno" > ${parf}
+echo "snpname: "${fn1}".chr1.snp" >> ${parf}
+echo "indivname: "${idf1} >> ${parf}
+echo "evecoutname: "${pt1}${of1}".evec" >> ${parf}
+echo "evaloutname: "${pt1}${of1}".eval" >> ${parf}
+echo "poplistname: "${pt1}${of1}".pops" >> ${parf}
+echo -e "altnormstype: NO\nnumoutevec: 10\nnumoutlieriter: 0\nnumoutlierevec: 0" >> ${parf}
+echo -e "outliersigmathresh: 6.0\nnumthreads: 8\nqtmode: 0" >> ${parf}
+echo -e "lsqproject: YES" >> ${parf}
+echo -e "numchrom: "${nchr} >> ${parf}
+
+## Run smartpca
+sbatch -c 8 --mem 15000 -J smartpca --wrap="smartpca -p ${parf} > ${of1}.log"
+
+## Reformat output and remove unnecessary files
+./eigenstrat_output_trimmer_220926.py ${of1}
+rm ${of1}.log; rm slurm-*
+
+
+############################################################################################
+## 14. Calculate heterozygosity per individual except Elch_KR_03 (Reference individual)   ##
+############################################################################################
+
+cd /home/projects1/Ellobium/PL_genotypes/
+
+pt1=($(pwd)"/")
+fn1=${pt1}"Ellobium.biSNP.q30.PL99.filtered.mac1"
+idf=${fn1}".ind"
+of1="Ellobium.biSNP.q30.PL99.filtered.mac1"
+tn1="temp_${of1}"
+
+echo -e "IND\tREFN\tREFP\tHETN\tHETP\tALTN\tALTP" > ${of1}.ind.frq
+
+numall=$(cat ${fn1}.geno | wc -l)
+for i in $(seq 1 15 | grep -v 11); do
+    num1=$(awk -v FS="" -v i=${i} '$i==2 {print $i}' ${fn1}.geno | wc -l)
+    num2=$(awk -v FS="" -v i=${i} '$i==1 {print $i}' ${fn1}.geno | wc -l)
+    num3=$(awk -v FS="" -v i=${i} '$i==0 {print $i}' ${fn1}.geno | wc -l)
+    ind=$(head -${i} ${idf} | tail -1 | awk '{print $1}')
+    echo -e "${num1}\t${num2}\t${num3}\t${numall}\t${ind}" |\
+    awk -v OFS="\t" '{print $5,$1,$1/$4,$2,$2/$4,$3,$3/$4}' >> ${of1}.ind.frq
+    echo "Calculating ${ind} is done"
+done
+
+
+#################################################
+## 15. Calculate pairwise Fst using vcftools   ##
+#################################################
+
+cd /home/projects1/Ellobium/analysis/
+mkdir -p ./Fst; cd ./Fst
+
+pt1=($(pwd)"/")
+fn1="/home/projects1/Ellobium/VCF_220826/VCF_filtering/Ellobium.filtered_passed"
+
+invcfs=""
+for nscaff in {1..30}; do
+    tvcf="${fn1}.${nscaff}.vcf.gz"
+    if [[ "$invcfs" == "" ]]; then invcfs+=${tvcf}; else invcfs+=" "${tvcf}; fi
+done
+sbatch -c 4 --mem 7500 --wrap="vcf-concat ${invcfs} | gzip -c > ${fn1}.all.vcf.gz"
+
+echo -e "Elch_CHN_01\nElch_CHN_02\nElch_CHN_03\nElch_CHN_04\nElch_CHN_05" > China_pop.txt
+echo -e "Elch_JP_01\nElch_JP_02\nElch_JP_05\nElch_JP_07\nElch_JP_11" > Japan_pop.txt
+echo -e "Elch_KR_37\nElch_KR_38\nElch_KR_39\nElch_KR_40" > Korea_pop.txt
+
+sbatch -c 4 --mem 7500 -p amd --wrap="vcftools --gzvcf ${fn1}.all.vcf.gz --weir-fst-pop China_pop.txt --weir-fst-pop Japan_pop.txt --out Ellobium_hardfilterd_VCF_China_Japan"  ## Took about 20min
+sbatch -c 4 --mem 7500 -p amd --wrap="vcftools --gzvcf ${fn1}.all.vcf.gz --weir-fst-pop China_pop.txt --weir-fst-pop Korea_pop.txt --out Ellobium_hardfilterd_VCF_China_Korea"
+sbatch -c 4 --mem 7500 -p amd --wrap="vcftools --gzvcf ${fn1}.all.vcf.gz --weir-fst-pop Japan_pop.txt --weir-fst-pop Korea_pop.txt --out Ellobium_hardfilterd_VCF_Japan_Korea"
+
+## Organize results
+echo -e "Pair\tmean_Fst\tweighted_Fst" > Ellobium_hardfilterd_VCF_summary.weir.fst
+echo -e "China_Japan\t0.0095005\t0.028031" >> Ellobium_hardfilterd_VCF_summary.weir.fst
+echo -e "China_Korea\t-0.0048195\t0.0054307" >> Ellobium_hardfilterd_VCF_summary.weir.fst
+echo -e "Japan_Korea\t0.0096876\t0.027302" >> Ellobium_hardfilterd_VCF_summary.weir.fst
+
+## Remove temporary files
+rm ${fn1}.all.vcf.gz
