@@ -1,1 +1,1 @@
-# Ellobium
+# Population genomic analysis of Ellobium Chinense
